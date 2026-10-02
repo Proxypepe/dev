@@ -1,0 +1,13 @@
+apiVersion: 1
+
+datasources:
+{% for ds in item.datasources %}
+  - name: {{ ds.name }}
+    type: {{ ds.type }}
+    access: {{ ds.access }}
+    url: {{ ds.url }}
+{% if ds.isDefault is defined and ds.isDefault %}
+    isDefault: true
+{% endif %}
+    editable: true
+{% endfor %}

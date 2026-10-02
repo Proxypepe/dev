@@ -1,0 +1,395 @@
+---
+- name: Deploy monitoring stack with Podman rootless and configs
+  hosts: monitoring_servers
+  become: yes
+  vars:
+    monitoring_user: monitoring
+    monitoring_home: /home/monitoring
+    
+    grafana_instances:
+      - name: grafana-prod
+        port: 3001
+        domain: grafana-prod.example.com
+        admin_user: admin
+        admin_password: "SuperSecretProd123!"
+        extra_env:
+          GF_INSTALL_PLUGINS: "grafana-clock-panel,grafana-piechart-panel"
+          GF_LOG_LEVEL: "info"
+        grafana_ini:
+          server:
+            root_url: "http://{{ item.domain }}"
+          security:
+            admin_user: "{{ item.admin_user }}"
+            admin_password: "{{ item.admin_password }}"
+          users:
+            allow_sign_up: "false"
+        datasources:
+          - name: VictoriaMetrics-01
+            type: prometheus
+            url: "http://vm-cluster-01:8428"
+            access: proxy
+            isDefault: true
+        dashboards:
+          providers:
+            - name: 'default'
+              orgId: 1
+              folder: ''
+              type: file
+              disableDeletion: false
+              updateIntervalSeconds: 10
+              options:
+                path: /var/lib/grafana/dashboards
+        
+      - name: grafana-dev
+        port: 3002
+        domain: grafana-dev.example.com
+        admin_user: admin
+        admin_password: "SuperSecretDev123!"
+        extra_env:
+          GF_LOG_LEVEL: "debug"
+        grafana_ini:
+          server:
+            root_url: "http://{{ item.domain }}"
+          security:
+            admin_user: "{{ item.admin_user }}"
+            admin_password: "{{ item.admin_password }}"
+          users:
+            allow_sign_up: "true"
+        datasources:
+          - name: VictoriaMetrics-Dev
+            type: prometheus
+            url: "http://vm-cluster-07:8434"
+            access: proxy
+            isDefault: true
+        
+    victoriametrics_instances:
+      - name: vm-cluster-01
+        port: 8428
+        domain: vm-01.example.com
+        retention: "30d"
+        extra_env:
+          TZ: "UTC"
+        scrape_config: |
+          global:
+            scrape_interval: 15s
+          scrape_configs:
+            - job_name: 'self'
+              static_configs:
+                - targets: ['localhost:8428']
+      - name: vm-cluster-02
+        port: 8429
+        domain: vm-02.example.com
+        retention: "30d"
+        extra_env:
+          TZ: "UTC"
+      - name: vm-cluster-03
+        port: 8430
+        domain: vm-03.example.com
+        retention: "60d"
+        extra_env:
+          TZ: "UTC"
+      - name: vm-cluster-04
+        port: 8431
+        domain: vm-04.example.com
+        retention: "30d"
+        extra_env:
+          TZ: "UTC"
+      - name: vm-cluster-05
+        port: 8432
+        domain: vm-05.example.com
+        retention: "30d"
+        extra_env:
+          TZ: "UTC"
+      - name: vm-cluster-06
+        port: 8433
+        domain: vm-06.example.com
+        retention: "30d"
+        extra_env:
+          TZ: "UTC"
+      - name: vm-cluster-07
+        port: 8434
+        domain: vm-07.example.com
+        retention: "7d"
+        extra_env:
+          TZ: "UTC"
+        
+    stack_dir: "{{ monitoring_home }}/monitoring-stack"
+
+  handlers:
+    - name: Reload systemd user
+      become: yes
+      become_user: "{{ monitoring_user }}"
+      ansible.builtin.systemd:
+        daemon_reload: yes
+        scope: user
+      tags: ['systemd', 'reload']
+
+    - name: Reload nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+      tags: ['nginx', 'reload']
+
+    - name: Restart changed Grafana instance
+      become: yes
+      become_user: "{{ monitoring_user }}"
+      ansible.builtin.command:
+        cmd: "podman-compose -f {{ stack_dir }}/docker-compose.yml restart {{ item.name }}"
+      loop: "{{ grafana_instances }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+      tags: ['grafana', 'restart']
+
+    - name: Reload VictoriaMetrics scrape config
+      become: yes
+      become_user: "{{ monitoring_user }}"
+      ansible.builtin.command:
+        cmd: "podman kill --signal=SIGHUP {{ item.name }}"
+      loop: "{{ victoriametrics_instances }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.scrape_config is defined
+      changed_when: false
+      tags: ['vm', 'reload']
+
+  tasks:
+    # ============================================
+    # БЛОК 1: Установка зависимостей
+    # ============================================
+    - name: Install Podman and Nginx
+      ansible.builtin.apt:
+        name:
+          - podman
+          - podman-compose
+          - uidmap
+          - nginx
+        state: present
+        update_cache: yes
+      tags: ['install', 'podman', 'nginx']
+
+    - name: Create monitoring user
+      ansible.builtin.user:
+        name: "{{ monitoring_user }}"
+        shell: /bin/bash
+        create_home: yes
+        state: present
+      tags: ['install', 'user', 'podman']
+
+    - name: Configure subuid for monitoring user
+      ansible.builtin.lineinfile:
+        path: /etc/subuid
+        line: "{{ monitoring_user }}:100000:65536"
+        create: yes
+        mode: '0644'
+      tags: ['install', 'user', 'podman']
+
+    - name: Configure subgid for monitoring user
+      ansible.builtin.lineinfile:
+        path: /etc/subgid
+        line: "{{ monitoring_user }}:100000:65536"
+        create: yes
+        mode: '0644'
+      tags: ['install', 'user', 'podman']
+
+    - name: Enable linger for monitoring user
+      ansible.builtin.command:
+        cmd: "loginctl enable-linger {{ monitoring_user }}"
+      changed_when: false
+      tags: ['install', 'user', 'podman']
+
+    # ============================================
+    # БЛОК 2: Создание директорий
+    # ============================================
+    - name: Create stack directory
+      ansible.builtin.file:
+        path: "{{ stack_dir }}"
+        state: directory
+        owner: "{{ monitoring_user }}"
+        group: "{{ monitoring_user }}"
+        mode: '0755'
+      tags: ['dirs', 'base']
+
+    - name: Create Grafana directories
+      ansible.builtin.file:
+        path: "{{ stack_dir }}/{{ item.0.name }}/{{ item.1 }}"
+        state: directory
+        owner: "{{ monitoring_user }}"
+        group: "{{ monitoring_user }}"
+        mode: '0755'
+      loop: "{{ grafana_instances | product(['data', 'provisioning/datasources', 'provisioning/dashboards', 'provisioning/notifiers', 'provisioning/plugins', 'config', 'dashboards']) | list }}"
+      loop_control:
+        label: "{{ item.0.name }}/{{ item.1 }}"
+      tags: ['dirs', 'grafana']
+
+    - name: Create VM data and config dirs
+      ansible.builtin.file:
+        path: "{{ stack_dir }}/{{ item.0.name }}/{{ item.1 }}"
+        state: directory
+        owner: "{{ monitoring_user }}"
+        group: "{{ monitoring_user }}"
+        mode: '0755'
+      loop: "{{ victoriametrics_instances | product(['data', 'config']) | list }}"
+      loop_control:
+        label: "{{ item.0.name }}/{{ item.1 }}"
+      tags: ['dirs', 'vm']
+
+    - name: Create systemd user directory
+      ansible.builtin.file:
+        path: "{{ monitoring_home }}/.config/systemd/user"
+        state: directory
+        owner: "{{ monitoring_user }}"
+        group: "{{ monitoring_user }}"
+        mode: '0755'
+      tags: ['dirs', 'systemd']
+
+    # ============================================
+    # БЛОК 3: Генерация конфигурации Grafana
+    # ============================================
+    
+    - name: "[Grafana] Generate grafana.ini for each instance"
+      ansible.builtin.template:
+        src: templates/grafana.ini.j2
+        dest: "{{ stack_dir }}/{{ item.name }}/config/grafana.ini"
+        owner: "{{ monitoring_user }}"
+        group: "{{ monitoring_user }}"
+        mode: '0644'
+      loop: "{{ grafana_instances }}"
+      loop_control:
+        label: "{{ item.name }}"
+      notify: Restart changed Grafana instance
+      tags: ['grafana', 'config', 'grafana-ini']
+
+    - name: "[Grafana] Generate datasources provisioning"
+      ansible.builtin.template:
+        src: templates/datasources.yml.j2
+        dest: "{{ stack_dir }}/{{ item.name }}/provisioning/datasources/datasources.yml"
+        owner: "{{ monitoring_user }}"
+        group: "{{ monitoring_user }}"
+        mode: '0644'
+      loop: "{{ grafana_instances }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.datasources is defined
+      notify: Restart changed Grafana instance
+      tags: ['grafana', 'config', 'datasources']
+
+    - name: "[Grafana] Generate dashboards provisioning"
+      ansible.builtin.template:
+        src: templates/dashboards.yml.j2
+        dest: "{{ stack_dir }}/{{ item.name }}/provisioning/dashboards/dashboards.yml"
+        owner: "{{ monitoring_user }}"
+        group: "{{ monitoring_user }}"
+        mode: '0644'
+      loop: "{{ grafana_instances }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.dashboards is defined
+      notify: Restart changed Grafana instance
+      tags: ['grafana', 'config', 'dashboards']
+
+    - name: "[Grafana] Generate alerting provisioning"
+      ansible.builtin.template:
+        src: templates/alerting.yml.j2
+        dest: "{{ stack_dir }}/{{ item.name }}/provisioning/alerting/alerting.yml"
+        owner: "{{ monitoring_user }}"
+        group: "{{ monitoring_user }}"
+        mode: '0644'
+      loop: "{{ grafana_instances }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.alerting is defined
+      notify: Restart changed Grafana instance
+      tags: ['grafana', 'config', 'alerting']
+
+    # ============================================
+    # БЛОК 4: Генерация конфигурации VictoriaMetrics
+    # ============================================
+    
+    - name: "[VM] Generate scrape configs for VictoriaMetrics"
+      ansible.builtin.copy:
+        content: "{{ item.scrape_config }}"
+        dest: "{{ stack_dir }}/{{ item.name }}/config/scrape.yml"
+        owner: "{{ monitoring_user }}"
+        group: "{{ monitoring_user }}"
+        mode: '0644'
+      loop: "{{ victoriametrics_instances }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.scrape_config is defined
+      notify: Reload VictoriaMetrics scrape config
+      tags: ['vm', 'config', 'scrape']
+
+    # ============================================
+    # БЛОК 5: Генерация docker-compose и systemd
+    # ============================================
+    
+    - name: Generate docker-compose.yml
+      ansible.builtin.template:
+        src: templates/docker-compose.yml.j2
+        dest: "{{ stack_dir }}/docker-compose.yml"
+        owner: "{{ monitoring_user }}"
+        group: "{{ monitoring_user }}"
+        mode: '0644'
+      tags: ['compose', 'config']
+
+    - name: Generate systemd user service file
+      ansible.builtin.template:
+        src: templates/monitoring-stack.service.j2
+        dest: "{{ monitoring_home }}/.config/systemd/user/monitoring-stack.service"
+        owner: "{{ monitoring_user }}"
+        group: "{{ monitoring_user }}"
+        mode: '0644'
+      notify: Reload systemd user
+      tags: ['systemd', 'config']
+
+    # ============================================
+    # БЛОК 6: Настройка Nginx
+    # ============================================
+    
+    - name: "[Nginx] Generate configs for Grafana"
+      ansible.builtin.template:
+        src: templates/nginx-grafana.conf.j2
+        dest: "/etc/nginx/conf.d/grafana-{{ item.name }}.conf"
+        owner: root
+        group: root
+        mode: '0644'
+      loop: "{{ grafana_instances }}"
+      loop_control:
+        label: "{{ item.name }}"
+      notify: Reload nginx
+      tags: ['nginx', 'config', 'grafana']
+
+    - name: "[Nginx] Generate configs for VictoriaMetrics"
+      ansible.builtin.template:
+        src: templates/nginx-victoriametrics.conf.j2
+        dest: "/etc/nginx/conf.d/vm-{{ item.name }}.conf"
+        owner: root
+        group: root
+        mode: '0644'
+      loop: "{{ victoriametrics_instances }}"
+      loop_control:
+        label: "{{ item.name }}"
+      notify: Reload nginx
+      tags: ['nginx', 'config', 'vm']
+
+    - name: Remove default Nginx config
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Reload nginx
+      tags: ['nginx', 'config']
+
+    # ============================================
+    # БЛОК 7: Запуск стека
+    # ============================================
+    
+    - name: Enable and start monitoring stack as user service
+      become: yes
+      become_user: "{{ monitoring_user }}"
+      ansible.builtin.systemd:
+        name: monitoring-stack
+        state: started
+        enabled: yes
+        scope: user
+      tags: ['start', 'systemd']

@@ -1,0 +1,23 @@
+apiVersion: 1
+
+contactPoints:
+{% for cp in item.alerting.contact_points %}
+  - orgId: 1
+    name: {{ cp.name }}
+    receivers:
+{% for receiver in cp.receivers %}
+      - uid: {{ receiver.uid }}
+        type: {{ receiver.type }}
+        settings:
+{% for key, value in receiver.settings.items() %}
+          {{ key }}: {{ value }}
+{% endfor %}
+{% endfor %}
+{% endfor %}
+
+policies:
+{% for policy in item.alerting.policies %}
+  - orgId: {{ policy.orgId }}
+    receiver: {{ policy.receiver }}
+    group_by: {{ policy.group_by | to_json }}
+{% endfor %}

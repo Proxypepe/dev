@@ -1,0 +1,83 @@
+services:
+{% for instance in grafana_instances %}
+  {{ instance.name }}:
+    image: grafana/grafana:10.4.0
+    container_name: {{ instance.name }}
+    restart: unless-stopped
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    ports:
+      - "127.0.0.1:{{ instance.port }}:3000"
+
+    environment:
+{% if instance.extra_env is defined %}
+{% for key, value in instance.extra_env.items() %}
+      - {{ key }}={{ value }}
+{% endfor %}
+{% endif %}
+
+    volumes:
+      - ./{{ instance.name }}/data:/var/lib/grafana
+      - ./{{ instance.name }}/config/grafana.ini:/etc/grafana/grafana.ini:ro
+      - ./{{ instance.name }}/provisioning:/etc/grafana/provisioning:ro
+      - ./{{ instance.name }}/dashboards:/var/lib/grafana/dashboards:ro
+
+    networks:
+      - monitoring-net
+
+{% endfor %}
+
+{% for instance in victoriametrics_instances %}
+  {{ instance.name }}:
+    image: victoriametrics/victoria-metrics:v1.101.0
+    container_name: {{ instance.name }}
+    restart: unless-stopped
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    ports:
+      - "127.0.0.1:{{ instance.port }}:8428"
+
+    command:
+      - "-retentionPeriod={{ instance.retention }}"
+      - "-storageDataPath=/victoria-metrics-data"
+      - "-httpListenAddr=:8428"
+{% if instance.extra_args is defined %}
+{% for arg in instance.extra_args %}
+      - "{{ arg }}"
+{% endfor %}
+{% endif %}
+{% if instance.scrape_config is defined %}
+      - "-promscrape.config=/config/scrape.yml"
+{% endif %}
+
+    environment:
+{% if instance.extra_env is defined %}
+{% for key, value in instance.extra_env.items() %}
+      - {{ key }}={{ value }}
+{% endfor %}
+{% endif %}
+
+    volumes:
+      - ./{{ instance.name }}/data:/victoria-metrics-data
+{% if instance.scrape_config is defined %}
+      - ./{{ instance.name }}/config/scrape.yml:/config/scrape.yml:ro
+{% endif %}
+
+    networks:
+      - monitoring-net
+
+{% endfor %}
+
+networks:
+  monitoring-net:
+    driver: bridge
