@@ -242,6 +242,171 @@ write_csv("logical_volumes.csv", logical, ["os_name", "type", "parent", "size_by
 write_csv("controllers.csv", controllers, ["pci_slot", "class", "device_id", "driver"])
 write_csv("raid_devices.csv", raid_devices, ["name", "state", "level", "members", "degraded"])
 
+
+# ---------- MARKDOWN ----------
+def human_bytes(b):
+    if b is None:
+        return "—"
+    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    v, i = float(b), 0
+    while v >= 1024 and i < len(units) - 1:
+        v /= 1024; i += 1
+    return f"{v:.2f} {units[i]}"
+
+
+def md_table(headers, rows):
+    if not rows:
+        return "_нет данных_\n"
+    cols = len(headers)
+    lines = ["| " + " | ".join(headers) + " |",
+             "| " + " | ".join(["---"] * cols) + " |"]
+    for r in rows:
+        cells = [str(r.get(h, "") if r.get(h) is not None else "—") for h in headers]
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def write_markdown(rpt):
+    s = rpt["server"]; c = rpt["cpu"]; m = rpt["memory"]
+    st = rpt["storage"]; ra = rpt["raid"]
+
+    lines = []
+    lines.append(f"# Аппаратный аудит: `{s['hostname'] or 'unknown'}`")
+    lines.append("")
+    lines.append(f"**Дата сбора:** {rpt['collected_at']}  ")
+    lines.append(f"**Схема:** {rpt['schema_version']}")
+    lines.append("")
+
+    # --- Server ---
+    lines.append("## Сервер")
+    lines.append("")
+    srv_rows = [
+        ("Производитель", s.get("manufacturer")),
+        ("Модель",        s.get("model")),
+        ("Серийный номер",s.get("serial")),
+        ("ОС",            s.get("os")),
+        ("Ядро",          s.get("kernel")),
+        ("Виртуализация", s.get("virtualization")),
+    ]
+    lines.append(md_table(["Параметр", "Значение"],
+                          [{"Параметр": k, "Значение": v} for k, v in srv_rows]))
+
+    # --- CPU ---
+    lines.append("## CPU")
+    lines.append("")
+    cpu_rows = [
+        ("Модель",            c.get("model")),
+        ("Сокетов",           c.get("sockets")),
+        ("Ядер на сокет",     c.get("cores_per_socket")),
+        ("Потоков на ядро",   c.get("threads_per_core")),
+        ("Физических ядер",   c.get("physical_cores_total")),
+        ("Логических CPU",    c.get("logical_cpus_total")),
+        ("Макс. частота, МГц",c.get("max_frequency_mhz")),
+    ]
+    lines.append(md_table(["Параметр", "Значение"],
+                          [{"Параметр": k, "Значение": v} for k, v in cpu_rows]))
+
+    # --- Memory ---
+    lines.append("## Оперативная память")
+    lines.append("")
+    lines.append(f"- Видимо ОС: **{human_bytes(m.get('os_total_bytes'))}**  ")
+    lines.append(f"- Слотов всего: **{m.get('dimm_slots_total') or '—'}**, "
+                 f"занято: **{m.get('dimm_slots_populated') or '—'}**  ")
+    lines.append(f"- Суммарный объём модулей: **{human_bytes(m.get('modules_total_bytes'))}**")
+    lines.append("")
+    mem_rows = []
+    for mod in m.get("modules", []):
+        mem_rows.append({
+            "Слот":   mod.get("locator"),
+            "Производитель": mod.get("manufacturer"),
+            "Part Number":   mod.get("part_number"),
+            "Объём": human_bytes(mod.get("size_bytes")),
+            "Тип":    mod.get("type"),
+            "Скорость, MT/s": mod.get("speed_mts"),
+            "Факт., MT/s":    mod.get("configured_speed_mts"),
+            "Rank": mod.get("rank"),
+        })
+    lines.append(md_table(
+        ["Слот", "Производитель", "Part Number", "Объём",
+         "Тип", "Скорость, MT/s", "Факт., MT/s", "Rank"],
+        mem_rows))
+
+    # --- Disks ---
+    lines.append("## Физические диски")
+    lines.append("")
+    disk_rows = []
+    for d in st.get("physical_disks", []):
+        disk_rows.append({
+            "Устр.":    d.get("os_name"),
+            "Vendor":   d.get("vendor"),
+            "Model":    d.get("model"),
+            "Serial":   d.get("serial"),
+            "Тип":      d.get("media_type"),
+            "Интерфейс":d.get("interface"),
+            "Объём":    human_bytes(d.get("size_bytes")),
+            "FW":       d.get("firmware"),
+            "SMART":    d.get("smart_health") or "—",
+        })
+    total_disk = sum(d.get("size_bytes") or 0 for d in st.get("physical_disks", []))
+    lines.append(f"**Суммарный объём физических дисков:** {human_bytes(total_disk)}")
+    lines.append("")
+    lines.append(md_table(
+        ["Устр.", "Vendor", "Model", "Serial", "Тип", "Интерфейс", "Объём", "FW", "SMART"],
+        disk_rows))
+
+    # --- Logical volumes ---
+    if st.get("logical_volumes"):
+        lines.append("## Логические тома / разделы")
+        lines.append("")
+        lv_rows = [{
+            "Имя": l.get("os_name"), "Тип": l.get("type"),
+            "Родитель": l.get("parent"), "Объём": human_bytes(l.get("size_bytes")),
+            "Точки монтирования": l.get("mountpoints") or "—",
+        } for l in st["logical_volumes"]]
+        lines.append(md_table(
+            ["Имя", "Тип", "Родитель", "Объём", "Точки монтирования"], lv_rows))
+
+    # --- RAID ---
+    lines.append("## RAID")
+    lines.append("")
+    lines.append(f"- Присутствует: **{'да' if ra.get('present') else 'нет'}**  ")
+    lines.append(f"- Режим: **{ra.get('mode') or '—'}**  ")
+    lines.append(f"- Уровень (SW): **{ra.get('level') or '—'}**")
+    lines.append("")
+    if ra.get("devices"):
+        dev_rows = [{
+            "Имя":   d.get("name"),
+            "Состояние": d.get("state"),
+            "Уровень":   d.get("level"),
+            "Деградация": "да" if d.get("degraded") else "нет",
+            "Устройства": ", ".join(d.get("members", [])) or "—",
+        } for d in ra["devices"]]
+        lines.append(md_table(
+            ["Имя", "Состояние", "Уровень", "Деградация", "Устройства"], dev_rows))
+    else:
+        lines.append("_Логических RAID-устройств не обнаружено._")
+    lines.append("")
+    if ra.get("note"):
+        lines.append(f"> {ra['note']}")
+        lines.append("")
+
+    # --- Controllers ---
+    if st.get("controllers"):
+        lines.append("## Контроллеры хранения (PCI)")
+        lines.append("")
+        ctrl_rows = [{
+            "PCI": c.get("pci_slot"), "Класс": c.get("class"),
+            "Device ID": c.get("device_id"), "Драйвер": c.get("driver") or "—",
+        } for c in st["controllers"]]
+        lines.append(md_table(["PCI", "Класс", "Device ID", "Драйвер"], ctrl_rows))
+
+    return "\n".join(lines)
+
+# В самом конце main-логики (после write_csv):
+md_path = OUT / "report.md"
+md_path.write_text(write_markdown(report), encoding="utf-8")
+print(f"Markdown: {md_path}")
+
 print(f"Готово: {OUT / 'report.json'}")
 print(f"CSV: {CSV}")
 for w in WARN:
