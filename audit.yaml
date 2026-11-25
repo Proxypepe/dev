@@ -1,0 +1,126 @@
+---
+- name: Hardware audit — collect, fetch, normalize
+  hosts: servers
+  gather_facts: false
+  serial: 0                       # 0 = все параллельно; 10-20% при большом парке
+  vars:
+    remote_tmp_base: /tmp
+    local_reports_dir: "{{ playbook_dir }}/reports"
+    audit_ts: "{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}-{{ inventory_hostname_short | default(inventory_hostname) }}"
+    remote_dir_name: "hw-audit-{{ inventory_hostname }}-{{ audit_ts }}"
+    remote_dir: "{{ remote_tmp_base }}/{{ remote_dir_name }}"
+    archive_name: "{{ remote_dir_name }}.tar.gz"
+    archive_path: "{{ remote_tmp_base }}/{{ archive_name }}"
+
+  tasks:
+    # ---------- 1. Сбор на таргете ----------
+    - name: Upload audit script
+      copy:
+        src: "{{ playbook_dir }}/hw_audit.sh"
+        dest: "{{ remote_tmp_base }}/hw_audit.sh"
+        mode: "0755"
+
+    - name: Run hw_audit.sh on target
+      block:
+        - name: Execute audit (sudo required for dmidecode/lshw)
+          command: "/bin/bash {{ remote_tmp_base }}/hw_audit.sh {{ remote_dir }}"
+          become: true
+          register: audit_result
+          changed_when: false
+
+        - name: Fail if audit dir is empty
+          stat:
+            path: "{{ remote_dir }}/raw"
+          register: raw_stat
+          failed_when: not raw_stat.stat.exists or not raw_stat.stat.isdir
+
+        # ---------- 2. Архивация и доставка ----------
+        - name: Pack raw data into tar.gz on target
+          archive:
+            path: "{{ remote_dir }}"
+            dest: "{{ archive_path }}"
+            format: gz
+          become: true
+
+        - name: Fetch archive to controller
+          fetch:
+            src: "{{ archive_path }}"
+            dest: "{{ local_reports_dir }}/{{ inventory_hostname }}/"
+            flat: true
+            fail_on_missing: true
+
+        # ---------- 3. Нормализация локально ----------
+        - name: Unpack archive locally
+          unarchive:
+            src: "{{ local_reports_dir }}/{{ inventory_hostname }}/{{ archive_name }}"
+            dest: "{{ local_reports_dir }}/{{ inventory_hostname }}/"
+            remote_src: false
+          delegate_to: localhost
+          become: false
+
+        - name: Remove local archive (keep unpacked dir)
+          file:
+            path: "{{ local_reports_dir }}/{{ inventory_hostname }}/{{ archive_name }}"
+            state: absent
+          delegate_to: localhost
+          become: false
+
+        - name: Run normalize.py locally
+          command: >
+            python3 {{ playbook_dir }}/normalize.py
+            {{ local_reports_dir }}/{{ inventory_hostname }}/{{ remote_dir_name }}
+          delegate_to: localhost
+          become: false
+          changed_when: false
+          register: norm_result
+
+        - name: Show normalize output
+          debug:
+            msg: "{{ norm_result.stdout_lines }}"
+
+      rescue:
+        - name: Report failure
+          debug:
+            msg: "Audit failed on {{ inventory_hostname }}: {{ ansible_failed_result | default('unknown error') }}"
+
+      always:
+        # ---------- 4. Очистка на таргете (всегда) ----------
+        - name: Remove remote archive
+          file:
+            path: "{{ archive_path }}"
+            state: absent
+          become: true
+          ignore_errors: true
+
+        - name: Remove remote audit directory
+          file:
+            path: "{{ remote_dir }}"
+            state: absent
+          become: true
+          ignore_errors: true
+
+        - name: Remove uploaded script
+          file:
+            path: "{{ remote_tmp_base }}/hw_audit.sh"
+            state: absent
+          become: true
+          ignore_errors: true
+
+# ---------- Итоговый отчёт по парку ----------
+- name: Summary across the fleet
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: List generated reports
+      find:
+        paths: "{{ playbook_dir }}/reports"
+        patterns: "report.json"
+        recurse: true
+      register: reports
+
+    - name: Print summary
+      debug:
+        msg: |
+          Collected {{ reports.files | length }} report(s):
+          {% for f in reports.files %}  - {{ f.path }}
+          {% endfor %}
